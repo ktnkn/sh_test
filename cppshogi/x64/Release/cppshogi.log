@@ -1,0 +1,5 @@
+﻿  コード生成しています。
+  Previous IPDB and IOBJ mismatch, fall back to full compilation.
+  All 1322 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  コード生成が終了しました。
+  cppshogi.vcxproj -> E:\python\DeepLearningShogi\x64\Release\cppshogi.dll

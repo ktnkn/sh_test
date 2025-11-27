@@ -1,0 +1,15 @@
+E:\python\DeepLearningShogi\cppshogi\bitboard.cpp;E:\python\DeepLearningShogi\cppshogi\x64\Release\bitboard.obj
+E:\python\DeepLearningShogi\cppshogi\book.cpp;E:\python\DeepLearningShogi\cppshogi\x64\Release\book.obj
+E:\python\DeepLearningShogi\cppshogi\common.cpp;E:\python\DeepLearningShogi\cppshogi\x64\Release\common.obj
+E:\python\DeepLearningShogi\cppshogi\cppshogi.cpp;E:\python\DeepLearningShogi\cppshogi\x64\Release\cppshogi.obj
+E:\python\DeepLearningShogi\cppshogi\dtype.cpp;E:\python\DeepLearningShogi\cppshogi\x64\Release\dtype.obj
+E:\python\DeepLearningShogi\cppshogi\generateMoves.cpp;E:\python\DeepLearningShogi\cppshogi\x64\Release\generateMoves.obj
+E:\python\DeepLearningShogi\cppshogi\hand.cpp;E:\python\DeepLearningShogi\cppshogi\x64\Release\hand.obj
+E:\python\DeepLearningShogi\cppshogi\init.cpp;E:\python\DeepLearningShogi\cppshogi\x64\Release\init.obj
+E:\python\DeepLearningShogi\cppshogi\move.cpp;E:\python\DeepLearningShogi\cppshogi\x64\Release\move.obj
+E:\python\DeepLearningShogi\cppshogi\mt64bit.cpp;E:\python\DeepLearningShogi\cppshogi\x64\Release\mt64bit.obj
+E:\python\DeepLearningShogi\cppshogi\position.cpp;E:\python\DeepLearningShogi\cppshogi\x64\Release\position.obj
+E:\python\DeepLearningShogi\cppshogi\python_module.cpp;E:\python\DeepLearningShogi\cppshogi\x64\Release\python_module.obj
+E:\python\DeepLearningShogi\cppshogi\search.cpp;E:\python\DeepLearningShogi\cppshogi\x64\Release\search.obj
+E:\python\DeepLearningShogi\cppshogi\square.cpp;E:\python\DeepLearningShogi\cppshogi\x64\Release\square.obj
+E:\python\DeepLearningShogi\cppshogi\usi.cpp;E:\python\DeepLearningShogi\cppshogi\x64\Release\usi.obj
