@@ -22,20 +22,25 @@ from dlshogi.data_loader import Hcpe3DataLoader
 from dlshogi.data_loader import DataLoader
 from transformer_shogi_moe.model import TransformerPolicyValueNetwork
 
+
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 def main(*argv):
     parser = argparse.ArgumentParser(description='Train policy value network (Transformer) with MTP')
     parser.add_argument('train_data', type=str, nargs='+', help='training data file(s) - can specify multiple hcpe files')
     parser.add_argument('test_data', type=str, help='test data file')
-    parser.add_argument('--batchsize', '-b', type=int, default=256, help='Number of positions in each mini-batch')
-    parser.add_argument('--testbatchsize', type=int, default=256, help='Number of positions in each test mini-batch')
+    parser.add_argument('--batchsize', '-b', type=int, default=128, help='Number of positions in each mini-batch')
+    parser.add_argument('--testbatchsize', type=int, default=128, help='Number of positions in each test mini-batch')
     parser.add_argument('--epoch', '-e', type=int, default=1, help='Number of epoch times')
-    parser.add_argument('--checkpoint', default='moe-{epoch:03}.pth', help='checkpoint file name')
+    parser.add_argument('--checkpoint', default='checkpoint-{epoch:03}.pth', help='checkpoint file name')
     parser.add_argument('--resume', '-r', default='', help='Resume from snapshot')
     parser.add_argument('--reset_optimizer', action='store_true')
     parser.add_argument('--model', type=str, help='model file name')
     parser.add_argument('--initmodel', '-m', default='', help='Initialize the model from given file (for compatibility)')
     parser.add_argument('--log', help='log file path')
-    parser.add_argument('--optimizer', default='AdamW(betas=(0.9, 0.999), eps=1e-8)', help='optimizer')
+    parser.add_argument('--optimizer', default='adamw_apex_fused(betas=(0.9, 0.999), eps=1e-8)', help='optimizer')
     parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.0001, help='weight decay rate')
     parser.add_argument('--lr_scheduler', default="CosineAnnealingLR(T_max=1)", help='learning rate scheduler')
@@ -64,7 +69,7 @@ def main(*argv):
     parser.add_argument('--d_model', type=int, default=512)
     parser.add_argument('--n_attention_head', type=int, default=8)
     parser.add_argument('--n_kv_head', type=int, default=2)
-    parser.add_argument('--num_layers', type=int, default=16)
+    parser.add_argument('--num_layers', type=int, default=8)
     parser.add_argument('--dim_feedforward', type=int, default=512)
     parser.add_argument('--dropout', type=float, default=0.1)
     
@@ -74,7 +79,7 @@ def main(*argv):
     # MoE args
     parser.add_argument('--num_experts', type=int, default=2, help='Number of experts for MoE')
     parser.add_argument('--num_experts_per_tok', type=int, default=1, help='Number of experts selected per token')
-    parser.add_argument('--aux_loss_coef', type=float, default=0.01, help='Coefficient for auxiliary load balancing loss')
+    parser.add_argument('--aux_loss_coef', type=float, default=0, help='Coefficient for auxiliary load balancing loss')
 
     args = parser.parse_args(argv)
 
