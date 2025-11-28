@@ -76,6 +76,10 @@ class MoELayer(nn.Module):
             ) for _ in range(num_experts)
         ])
         self.gate = nn.Linear(d_model, num_experts, bias=False)
+        
+        # Bias for load balancing (DeepSeek V3 style)
+        self.register_buffer("e_score_correction_bias", torch.zeros(num_experts))
+        self.bias_update_rate = 0.0001 
 
     def forward(self, x):
         batch_size, seq_len, d_model = x.shape
@@ -83,21 +87,42 @@ class MoELayer(nn.Module):
         
         # Router logits: (batch * seq_len, num_experts)
         router_logits = self.gate(x_flat)
-        routing_weights = F.softmax(router_logits, dim=1)
+        
+        # DeepSeek V3 uses Sigmoid
+        routing_probs = router_logits.sigmoid()
+        
+        # Add bias for selection
+        routing_probs_for_choice = routing_probs
+        if self.training:
+             routing_probs_for_choice = routing_probs + self.e_score_correction_bias
         
         # Select top-k experts
-        routing_weights_topk, selected_experts = torch.topk(routing_weights, self.num_experts_per_tok, dim=-1)
+        _, selected_experts = torch.topk(routing_probs_for_choice, self.num_experts_per_tok, dim=-1)
+        
+        # Get weights for selected experts (using original probs)
+        routing_weights_topk = routing_probs.gather(1, selected_experts)
         
         # Normalize weights
-        routing_weights_topk = routing_weights_topk / routing_weights_topk.sum(dim=-1, keepdim=True)
+        routing_weights_topk = routing_weights_topk / (routing_weights_topk.sum(dim=-1, keepdim=True) + 1e-6)
         
         # Calculate auxiliary loss (load balancing)
         if self.training:
-            # P_i: fraction of weight given to expert i (mean of routing_weights[:, i])
-            density_1_proxy = routing_weights.mean(dim=0)
+            # Update bias based on usage
+            with torch.no_grad():
+                mask = F.one_hot(selected_experts, num_classes=self.num_experts).sum(dim=1) # (T, num_experts)
+                usage = mask.float().mean(dim=0) # (num_experts,)
+                target_usage = self.num_experts_per_tok / self.num_experts
+                
+                # If usage < target, increase bias. If usage > target, decrease bias.
+                error = target_usage - usage
+                self.e_score_correction_bias += self.bias_update_rate * error
+
+            # Aux loss (standard)
+            # P_i: fraction of weight given to expert i
+            density_1_proxy = routing_probs.mean(dim=0)
             
             # f_i: fraction of tokens routed to expert i
-            mask = F.one_hot(selected_experts, num_classes=self.num_experts).sum(dim=1) # (T, num_experts)
+            # mask is already calculated above
             density_1 = mask.float().mean(dim=0)
             
             aux_loss = (density_1_proxy * density_1).sum() * self.num_experts
