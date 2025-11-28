@@ -40,7 +40,7 @@ def main(*argv):
     parser.add_argument('--model', type=str, help='model file name')
     parser.add_argument('--initmodel', '-m', default='', help='Initialize the model from given file (for compatibility)')
     parser.add_argument('--log', help='log file path')
-    parser.add_argument('--optimizer', default='adamw_apex_fused(betas=(0.9, 0.999), eps=1e-8)', help='optimizer')
+    parser.add_argument('--optimizer', default='AdamW(betas=(0.9, 0.999), eps=1e-8)', help='optimizer')
     parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.0001, help='weight decay rate')
     parser.add_argument('--lr_scheduler', default="CosineAnnealingLR(T_max=1)", help='learning rate scheduler')
@@ -549,3 +549,4 @@ def main(*argv):
 
 if __name__ == '__main__':
     main(*sys.argv[1:])
+
