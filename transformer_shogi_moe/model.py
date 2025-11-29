@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from dlshogi.common import FEATURES1_NUM, FEATURES2_NUM, MAX_MOVE_LABEL_NUM
 
 class GroupedQueryAttention(nn.Module):
@@ -67,19 +68,28 @@ class MoELayer(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(d_model, dim_feedforward),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(dim_feedforward, d_model)
-            ) for _ in range(num_experts)
-        ])
+        self.d_model = d_model
+        self.dim_feedforward = dim_feedforward
+        
+        # Experts weights: (num_experts, in_features, out_features)
+        # w1: d_model -> dim_feedforward
+        self.w1 = nn.Parameter(torch.empty(num_experts, d_model, dim_feedforward))
+        # w2: dim_feedforward -> d_model
+        self.w2 = nn.Parameter(torch.empty(num_experts, dim_feedforward, d_model))
+        
+        self.dropout = nn.Dropout(dropout)
         self.gate = nn.Linear(d_model, num_experts, bias=False)
         
         # Bias for load balancing (DeepSeek V3 style)
         self.register_buffer("e_score_correction_bias", torch.zeros(num_experts))
         self.bias_update_rate = 0.0001 
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Initialize weights similar to nn.Linear
+        nn.init.kaiming_uniform_(self.w1, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.w2, a=math.sqrt(5))
 
     def forward(self, x):
         batch_size, seq_len, d_model = x.shape
@@ -118,38 +128,68 @@ class MoELayer(nn.Module):
                 self.e_score_correction_bias += self.bias_update_rate * error
 
             # Aux loss (standard)
-            # P_i: fraction of weight given to expert i
             density_1_proxy = routing_probs.mean(dim=0)
-            
-            # f_i: fraction of tokens routed to expert i
-            # mask is already calculated above
             density_1 = mask.float().mean(dim=0)
-            
             aux_loss = (density_1_proxy * density_1).sum() * self.num_experts
         else:
             aux_loss = 0.0
 
-        # Compute output
-        final_output = torch.zeros_like(x_flat)
+        # Parallel Expert Computation using BMM
         
+        # Flatten selected experts to (B*T*k)
+        expert_indices = selected_experts.flatten()
+        
+        # Repeat x for each selected expert: (B*T, k, D) -> (B*T*k, D)
+        x_repeated = x_flat.unsqueeze(1).expand(-1, self.num_experts_per_tok, -1).reshape(-1, d_model)
+        
+        # Sort tokens by expert index to group them
+        sorted_indices = torch.argsort(expert_indices)
+        sorted_expert_indices = expert_indices[sorted_indices]
+        sorted_x = x_repeated[sorted_indices]
+        
+        # Count tokens per expert
+        counts = torch.bincount(sorted_expert_indices, minlength=self.num_experts)
+        max_count = counts.max().item()
+        
+        # Pad inputs to (num_experts, max_count, d_model)
+        padded_x = torch.zeros(self.num_experts, max_count, d_model, device=x.device, dtype=x.dtype)
+        
+        start = 0
         for i in range(self.num_experts):
-            # Find which tokens selected expert i
-            idx = (selected_experts == i).nonzero(as_tuple=True) # (row_indices, col_indices_in_topk)
-            
-            if len(idx[0]) == 0:
-                continue
-                
-            batch_idx = idx[0]
-            
-            # Process tokens
-            expert_input = x_flat[batch_idx]
-            expert_output = self.experts[i](expert_input)
-            
-            # Weight by the routing weight
-            weight = routing_weights_topk[idx] # (num_selected_tokens,)
-            
-            # Add to final output
-            final_output.index_add_(0, batch_idx, weight.unsqueeze(1) * expert_output)
+            c = counts[i].item()
+            if c > 0:
+                padded_x[i, :c] = sorted_x[start:start+c]
+                start += c
+        
+        # BMM 1: (E, M, D) @ (E, D, H) -> (E, M, H)
+        h = torch.bmm(padded_x, self.w1)
+        h = F.gelu(h)
+        h = self.dropout(h)
+        
+        # BMM 2: (E, M, H) @ (E, H, D) -> (E, M, D)
+        out_padded = torch.bmm(h, self.w2)
+        
+        # Unpad and reconstruct sorted output
+        sorted_out = torch.zeros_like(sorted_x)
+        start = 0
+        for i in range(self.num_experts):
+            c = counts[i].item()
+            if c > 0:
+                sorted_out[start:start+c] = out_padded[i, :c]
+                start += c
+        
+        # Unsort to get back to original order (B*T*k)
+        out_repeated = torch.empty_like(x_repeated)
+        out_repeated[sorted_indices] = sorted_out
+        
+        # Weight outputs and sum over k
+        # routing_weights_topk: (B*T, k) -> flatten -> (B*T*k)
+        weights_flat = routing_weights_topk.flatten()
+        out_weighted = out_repeated * weights_flat.unsqueeze(1)
+        
+        # Reshape to (B*T, k, D) and sum
+        out_weighted = out_weighted.view(-1, self.num_experts_per_tok, d_model)
+        final_output = out_weighted.sum(dim=1)
             
         return final_output.view(batch_size, seq_len, d_model), aux_loss
 
