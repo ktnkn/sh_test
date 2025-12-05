@@ -44,7 +44,7 @@ def main(*argv):
     parser.add_argument('--optimizer', default='AdamW(betas=(0.9, 0.999), eps=1e-8)', help='optimizer')
     parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.0001, help='weight decay rate')
-    parser.add_argument('--lr_scheduler', help='learning rate scheduler')
+    parser.add_argument('--lr_scheduler', default='CosineAnnealingLR(T_max=1)', help='learning rate scheduler')
     parser.add_argument('--scheduler_step_mode', type=str, default='epoch', choices=['epoch', 'step'], help='Scheduler step mode: epoch or step')
     parser.add_argument('--reset_scheduler', action='store_true')
     parser.add_argument('--clip_grad_max_norm', type=float, default=10.0, help='max norm of the gradients')
@@ -564,3 +564,4 @@ def main(*argv):
 
 if __name__ == '__main__':
     main(*sys.argv[1:])
+
