@@ -4,6 +4,60 @@ import torch.nn.functional as F
 import math
 from dlshogi.common import FEATURES1_NUM, FEATURES2_NUM, MAX_MOVE_LABEL_NUM
 
+
+
+class LinearPolicyHead(nn.Module):
+    def __init__(self, d_model, out_channels):
+        super().__init__()
+        self.linear1 = nn.Linear(d_model, d_model, bias=False)
+        self.bn = nn.BatchNorm1d(d_model)
+        self.gelu = nn.GELU()
+        self.linear2 = nn.Linear(d_model, out_channels)
+
+    def forward(self, x):
+        # x: (B, 81, d_model)
+        x = self.linear1(x)
+        
+        # BatchNorm applied to (N, C)
+        b, s, d = x.shape
+        x = x.view(b * s, d)
+        x = self.bn(x)
+        x = x.view(b, s, d)
+        
+        x = self.gelu(x)
+        x = self.linear2(x) # (B, 81, out_channels)
+        
+        # (B, 81, out) -> (B, out, 81) to match dlshogi label order (Direction-major)
+        x = x.transpose(1, 2)
+        
+        return x.flatten(start_dim=1)
+
+
+class BoardEmbedding(nn.Module):
+    def __init__(self, in_channels, d_model):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, d_model, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(d_model),
+            nn.GELU()
+        )
+
+    def forward(self, x):
+        # x: (B, C, 9, 9)
+        out = self.conv(x)
+        b, c, h, w = out.shape
+        # (B, d_model, 9, 9) -> (B, 81, d_model)
+        return out.view(b, c, -1).permute(0, 2, 1)
+
+
+
+
+
+
+
+
+
+
 class GroupedQueryAttention(nn.Module):
     def __init__(self, d_model, n_attention_head, n_kv_head, dropout=0.1):
         super().__init__()
@@ -93,7 +147,7 @@ class MoELayer(nn.Module):
 
     def forward(self, x):
         batch_size, seq_len, d_model = x.shape
-        x_flat = x.view(-1, d_model)
+        x_flat = x.reshape(-1, d_model)
         
         # Router logits: (batch * seq_len, num_experts)
         router_logits = self.gate(x_flat)
@@ -227,8 +281,11 @@ class TransformerEncoderLayerGQA(nn.Module):
         src = self.norm2(src)
         return src, aux_loss
 
+
+
+
 class TransformerPolicyValueNetwork(nn.Module):
-    def __init__(self, d_model=256, n_attention_head=8, n_kv_head=2, num_layers=8, dim_feedforward=512, dropout=0.1, mtp_heads=0, num_experts=1, num_experts_per_tok=1):
+    def __init__(self, d_model=256, n_attention_head=8, n_kv_head=2, num_layers=4, dim_feedforward=512, dropout=0.1, mtp_heads=0, num_experts=1, num_experts_per_tok=1):
         super(TransformerPolicyValueNetwork, self).__init__()
         
         self.d_model = d_model
@@ -236,7 +293,7 @@ class TransformerPolicyValueNetwork(nn.Module):
         self.num_experts = num_experts
 
         # Embedding for board features (x1)
-        self.embedding1 = nn.Linear(FEATURES1_NUM, d_model)
+        self.embedding1 = BoardEmbedding(FEATURES1_NUM, d_model)
         
         # Embedding for global/hand features (x2)
         self.embedding2 = nn.Linear(FEATURES2_NUM, d_model)
@@ -250,17 +307,12 @@ class TransformerPolicyValueNetwork(nn.Module):
         ])
         
         # Policy head (Main)
-        self.policy_head = nn.Sequential(
-            nn.Linear(d_model, MAX_MOVE_LABEL_NUM),
-            nn.Flatten(start_dim=1) 
-        )
+        self.policy_head = LinearPolicyHead(d_model, MAX_MOVE_LABEL_NUM)
         
         # MTP Policy heads
         self.mtp_policy_heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(d_model, MAX_MOVE_LABEL_NUM),
-                nn.Flatten(start_dim=1) 
-            ) for _ in range(mtp_heads)
+            LinearPolicyHead(d_model, MAX_MOVE_LABEL_NUM)
+            for _ in range(mtp_heads)
         ])
         
         # MTP Value heads
@@ -274,19 +326,21 @@ class TransformerPolicyValueNetwork(nn.Module):
         
         # Value head
         self.value_head = nn.Sequential(
-            nn.Linear(d_model * 81, 256),
+            nn.Linear(d_model, 1024),
             nn.GELU(),
-            nn.Linear(256, 1)
+            nn.Linear(1024, 1)
         )
 
     def forward(self, x1, x2):
         b, c1, h, w = x1.shape
         c2 = x2.shape[1]
         
-        x1_flat = x1.view(b, c1, -1).permute(0, 2, 1) 
+        # x1: (B, C1, 9, 9) -> embedding1 -> (B, 81, d_model)
+        x = self.embedding1(x1)
+        
         x2_flat = x2.view(b, c2, -1).permute(0, 2, 1)
         
-        x = self.embedding1(x1_flat) + self.embedding2(x2_flat)
+        x = x + self.embedding2(x2_flat)
         x = x + self.pos_encoder
         
         total_aux_loss = 0.0
@@ -295,7 +349,10 @@ class TransformerPolicyValueNetwork(nn.Module):
             total_aux_loss += aux_loss
         
         y1 = self.policy_head(x)
-        y2 = self.value_head(x.view(b, -1))
+        
+        # Value head: use mean pooling over sequence dimension
+        # (B, 81, d_model) -> (B, d_model)
+        y2 = self.value_head(x.mean(dim=1))
         
         if self.mtp_heads > 0:
             mtp_policy_logits = [head(x) for head in self.mtp_policy_heads]
