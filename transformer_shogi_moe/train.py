@@ -31,10 +31,11 @@ def main(*argv):
     parser = argparse.ArgumentParser(description='Train policy value network (Transformer) with MTP')
     parser.add_argument('train_data', type=str, nargs='+', help='training data file(s) - can specify multiple hcpe files')
     parser.add_argument('test_data', type=str, help='test data file')
-    parser.add_argument('--batchsize', '-b', type=int, default=128, help='Number of positions in each mini-batch')
-    parser.add_argument('--testbatchsize', type=int, default=128, help='Number of positions in each test mini-batch')
+    parser.add_argument('--use_compile', action='store_true',default=True, help='Use torch.compile for optimization')
+    parser.add_argument('--batchsize', '-b', type=int, default=224, help='Number of positions in each mini-batch')
+    parser.add_argument('--testbatchsize', type=int, default=224, help='Number of positions in each test mini-batch')
     parser.add_argument('--epoch', '-e', type=int, default=1, help='Number of epoch times')
-    parser.add_argument('--checkpoint', default='checkpoint-{epoch:03}.pth', help='checkpoint file name')
+    parser.add_argument('--checkpoint', default='moe-batch.pth', help='checkpoint file name')
     parser.add_argument('--resume', '-r', default='', help='Resume from snapshot')
     parser.add_argument('--reset_optimizer', action='store_true')
     parser.add_argument('--model', type=str, help='model file name')
@@ -43,7 +44,7 @@ def main(*argv):
     parser.add_argument('--optimizer', default='AdamW(betas=(0.9, 0.999), eps=1e-8)', help='optimizer')
     parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.0001, help='weight decay rate')
-    parser.add_argument('--lr_scheduler', default="CosineAnnealingLR(T_max=1)", help='learning rate scheduler')
+    parser.add_argument('--lr_scheduler', help='learning rate scheduler')
     parser.add_argument('--scheduler_step_mode', type=str, default='epoch', choices=['epoch', 'step'], help='Scheduler step mode: epoch or step')
     parser.add_argument('--reset_scheduler', action='store_true')
     parser.add_argument('--clip_grad_max_norm', type=float, default=10.0, help='max norm of the gradients')
@@ -66,20 +67,21 @@ def main(*argv):
     parser.add_argument('--cache', type=str, help='training data cache file')
 
     # Transformer args
-    parser.add_argument('--d_model', type=int, default=512)
-    parser.add_argument('--n_attention_head', type=int, default=8)
-    parser.add_argument('--n_kv_head', type=int, default=2)
-    parser.add_argument('--num_layers', type=int, default=8)
-    parser.add_argument('--dim_feedforward', type=int, default=512)
+    parser.add_argument('--d_model', type=int, default=1024)
+    parser.add_argument('--n_attention_head', type=int, default=16)
+    parser.add_argument('--n_kv_head', type=int, default=4)
+    parser.add_argument('--num_layers', type=int, default=4)
+    parser.add_argument('--dim_feedforward', type=int, default=4096)
     parser.add_argument('--dropout', type=float, default=0.1)
     
     # MTP args
     parser.add_argument('--mtp_heads', type=int, default=0, help='Number of Multi-Token Prediction heads')
 
     # MoE args
-    parser.add_argument('--num_experts', type=int, default=2, help='Number of experts for MoE')
-    parser.add_argument('--num_experts_per_tok', type=int, default=1, help='Number of experts selected per token')
+    parser.add_argument('--num_experts', type=int, default=0, help='Number of experts for MoE')
+    parser.add_argument('--num_experts_per_tok', type=int, default=0, help='Number of experts selected per token')
     parser.add_argument('--aux_loss_coef', type=float, default=0, help='Coefficient for auxiliary load balancing loss')
+    parser.add_argument('--warmup_steps', type=int, default=200, help='Number of warmup steps')
 
     args = parser.parse_args(argv)
 
@@ -120,6 +122,11 @@ def main(*argv):
         num_experts_per_tok=args.num_experts_per_tok
     )
     model.to(device)
+
+    if args.use_compile:
+        logging.info('Using torch.compile')
+        model = torch.compile(model, mode="default")
+
 
     def create_optimizer(optimizer_str, model_params, lr, weight_decay):
         optimizer_name, optimizer_args = optimizer_str.split('(', 1)
@@ -328,7 +335,7 @@ def main(*argv):
 
     for e in range(args.epoch):
         if args.lr_scheduler:
-            logging.info('lr_scheduler lr={}'.format(scheduler.get_last_lr()[0]))
+            logging.info('lr_scheduler lr={}'.format(optimizer.param_groups[0]['lr']))
         if args.val_lambda_decay_epoch:
             # update val_lambda
             val_lambda = max(
@@ -357,6 +364,11 @@ def main(*argv):
         for _ in pbar:
             t += 1
             steps += 1
+
+            if args.warmup_steps > 0 and t <= args.warmup_steps:
+                lr = args.lr * t / args.warmup_steps
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr
             
             with torch.amp.autocast('cuda', enabled=args.use_amp, dtype=amp_dtype):
                 model.train()
@@ -375,7 +387,7 @@ def main(*argv):
                     # Forward
                     y1, y2, mtp_policy_logits, mtp_value_logits, aux_loss = model(x1, x2)
                     
-                    model.zero_grad()
+                    model.zero_grad(set_to_none=True)
                     loss1 = cross_entropy_loss_with_soft_target(y1, t1)
                     
                     # MTP Losses
@@ -422,7 +434,7 @@ def main(*argv):
                         
                     y1, y2, aux_loss = model(x1, x2)
 
-                    model.zero_grad()
+                    model.zero_grad(set_to_none=True)
                     loss1 = cross_entropy_loss_with_soft_target(y1, t1)
                     if args.use_critic:
                         z = t2.view(-1) - value.view(-1) + 0.5
@@ -445,24 +457,25 @@ def main(*argv):
             if args.use_swa and epoch >= args.swa_start_epoch and t % args.swa_freq == 0:
                 swa_model.update_parameters(model)
 
-            sum_loss1 += loss1.item()
-            sum_loss2 += loss2.item()
-            sum_loss3 += loss3.item()
-            sum_loss += loss.item()
+            sum_loss1 += loss1.detach()
+            sum_loss2 += loss2.detach()
+            sum_loss3 += loss3.detach()
+            sum_loss += loss.detach()
 
-            # Update progress bar with current loss
-            postfix = {
-                'loss': f'{loss.item():.4f}',
-                'loss1': f'{loss1.item():.4f}',
-                'loss2': f'{loss2.item():.4f}',
-                'loss3': f'{loss3.item():.4f}'
-            }
-            if args.mtp_heads > 0:
-                postfix['mtp_loss'] = f'{mtp_loss.item():.4f}'
-            if args.num_experts > 1:
-                postfix['aux_loss'] = f'{aux_loss.item():.4f}'
-                
-            pbar.set_postfix(postfix)
+            # Update progress bar with current loss (every 50 steps to avoid sync overhead)
+            if steps % 50 == 0:
+                postfix = {
+                    'loss': f'{loss.item():.4f}',
+                    'loss1': f'{loss1.item():.4f}',
+                    'loss2': f'{loss2.item():.4f}',
+                    'loss3': f'{loss3.item():.4f}'
+                }
+                if args.mtp_heads > 0:
+                    postfix['mtp_loss'] = f'{mtp_loss.item():.4f}'
+                if args.num_experts > 1:
+                    postfix['aux_loss'] = f'{aux_loss.item():.4f}'
+                    
+                pbar.set_postfix(postfix)
 
             # print train loss
             if t % eval_interval == 0:
@@ -482,7 +495,7 @@ def main(*argv):
 
                     logging.info('epoch = {}, steps = {}, train loss = {:.07f}, {:.07f}, {:.07f}, {:.07f}, test loss = {:.07f}, {:.07f}, {:.07f}, {:.07f}, test accuracy = {:.07f}, {:.07f}'.format(
                         epoch, t,
-                        sum_loss1 / steps, sum_loss2 / steps, sum_loss3 / steps, sum_loss / steps,
+                        sum_loss1.item() / steps, sum_loss2.item() / steps, sum_loss3.item() / steps, sum_loss.item() / steps,
                         loss1.item(), loss2.item(), loss3.item(), loss.item(),
                         accuracy(y1, t1), binary_accuracy(y2, t2)))
 
@@ -499,7 +512,8 @@ def main(*argv):
                 sum_loss = 0
 
             if args.lr_scheduler and args.scheduler_step_mode == 'step':
-                scheduler.step()
+                if args.warmup_steps <= 0 or t > args.warmup_steps:
+                    scheduler.step()
 
         steps_epoch += steps
         sum_loss1_epoch += sum_loss1
@@ -512,13 +526,14 @@ def main(*argv):
 
         logging.info('epoch = {}, steps = {}, train loss avr = {:.07f}, {:.07f}, {:.07f}, {:.07f}, test loss = {:.07f}, {:.07f}, {:.07f}, {:.07f}, test accuracy = {:.07f}, {:.07f}, test entropy = {:.07f}, {:.07f}'.format(
             epoch, t,
-            sum_loss1_epoch / steps_epoch, sum_loss2_epoch / steps_epoch, sum_loss3_epoch / steps_epoch, sum_loss_epoch / steps_epoch,
+            sum_loss1_epoch.item() / steps_epoch, sum_loss2_epoch.item() / steps_epoch, sum_loss3_epoch.item() / steps_epoch, sum_loss_epoch.item() / steps_epoch,
             test_loss1, test_loss2, test_loss3, test_loss,
             test_accuracy1, test_accuracy2,
             test_entropy1, test_entropy2))
 
         if args.lr_scheduler and args.scheduler_step_mode == 'epoch':
-            scheduler.step()
+            if args.warmup_steps <= 0 or t > args.warmup_steps:
+                scheduler.step()
 
         # save checkpoint
         if args.checkpoint:
@@ -549,4 +564,3 @@ def main(*argv):
 
 if __name__ == '__main__':
     main(*sys.argv[1:])
-
