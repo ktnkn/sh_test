@@ -125,6 +125,8 @@ def main(*argv):
 
     if args.use_compile:
         logging.info('Using torch.compile')
+        # Enable capturing scalar outputs to avoid graph breaks from .item() calls
+        torch._dynamo.config.capture_scalar_outputs = True
         model = torch.compile(model, mode="default")
 
 
@@ -564,4 +566,5 @@ def main(*argv):
 
 if __name__ == '__main__':
     main(*sys.argv[1:])
+
 
