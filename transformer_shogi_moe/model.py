@@ -343,7 +343,12 @@ class TransformerPolicyValueNetwork(nn.Module):
         c2 = x2.shape[1]
         
         # x1: (B, C1, 9, 9) -> embedding1 -> (B, 81, d_model)
-        x = self.embedding1(x1)
+        if isinstance(self.embedding1, nn.Linear):
+            # Permute (B, C, H, W) -> (B, H, W, C) -> (B, H*W, C)
+            x1_reshaped = x1.permute(0, 2, 3, 1).reshape(b, -1, c1)
+            x = self.embedding1(x1_reshaped)
+        else:
+            x = self.embedding1(x1)
         
         x2_flat = x2.view(b, c2, -1).permute(0, 2, 1)
         
