@@ -59,7 +59,7 @@ def main(*argv):
     parser.add_argument('--swa_freq', type=int, default=250)
     parser.add_argument('--swa_n_avr', type=int, default=10)
     parser.add_argument('--use_amp', default=True, action='store_true', help='Use automatic mixed precision')
-    parser.add_argument('--amp_dtype', type=str, default='float16', choices=['float16', 'bfloat16'], help='Data type for automatic mixed precision')
+    parser.add_argument('--amp_dtype', type=str, default='float16', choices=['float16', 'bfloat16', 'float8'], help='Data type for automatic mixed precision')
     parser.add_argument('--use_average', action='store_true')
     parser.add_argument('--use_evalfix', action='store_true')
     parser.add_argument('--temperature', type=float, default=1.0)
@@ -183,7 +183,13 @@ def main(*argv):
     bce_with_logits_loss = torch.nn.BCEWithLogitsLoss()
     if args.use_amp:
         logging.info(f'use amp dtype={args.amp_dtype}')
-    amp_dtype = torch.bfloat16 if args.amp_dtype == 'bfloat16' else torch.float16
+    
+    if args.amp_dtype == 'float8':
+        amp_dtype = torch.float8_e4m3fn
+    elif args.amp_dtype == 'bfloat16':
+        amp_dtype = torch.bfloat16
+    else:
+        amp_dtype = torch.float16
     scaler = torch.cuda.amp.GradScaler(enabled=args.use_amp)
 
     if args.use_evalfix:
