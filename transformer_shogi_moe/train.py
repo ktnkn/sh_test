@@ -32,8 +32,8 @@ def main(*argv):
     parser.add_argument('train_data', type=str, nargs='+', help='training data file(s) - can specify multiple hcpe files')
     parser.add_argument('test_data', type=str, help='test data file')
     parser.add_argument('--use_compile', action='store_true',default=True, help='Use torch.compile for optimization')
-    parser.add_argument('--batchsize', '-b', type=int, default=224, help='Number of positions in each mini-batch')
-    parser.add_argument('--testbatchsize', type=int, default=224, help='Number of positions in each test mini-batch')
+    parser.add_argument('--batchsize', '-b', type=int, default=112, help='Number of positions in each mini-batch')
+    parser.add_argument('--testbatchsize', type=int, default=112, help='Number of positions in each test mini-batch')
     parser.add_argument('--epoch', '-e', type=int, default=1, help='Number of epoch times')
     parser.add_argument('--checkpoint', default='moe-batch.pth', help='checkpoint file name')
     parser.add_argument('--resume', '-r', default='', help='Resume from snapshot')
@@ -44,7 +44,7 @@ def main(*argv):
     parser.add_argument('--optimizer', default='AdamW(betas=(0.9, 0.999), eps=1e-8)', help='optimizer')
     parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.0001, help='weight decay rate')
-    parser.add_argument('--lr_scheduler', default='CosineAnnealingLR(T_max=1)', help='learning rate scheduler')
+    parser.add_argument('--lr_scheduler', help='learning rate scheduler')
     parser.add_argument('--scheduler_step_mode', type=str, default='epoch', choices=['epoch', 'step'], help='Scheduler step mode: epoch or step')
     parser.add_argument('--reset_scheduler', action='store_true')
     parser.add_argument('--clip_grad_max_norm', type=float, default=10.0, help='max norm of the gradients')
@@ -67,21 +67,22 @@ def main(*argv):
     parser.add_argument('--cache', type=str, help='training data cache file')
 
     # Transformer args
-    parser.add_argument('--d_model', type=int, default=1024)
+    parser.add_argument('--d_model', type=int, default=768)
     parser.add_argument('--n_attention_head', type=int, default=16)
     parser.add_argument('--n_kv_head', type=int, default=4)
-    parser.add_argument('--num_layers', type=int, default=4)
-    parser.add_argument('--dim_feedforward', type=int, default=4096)
+    parser.add_argument('--num_layers', type=int, default=7)
+    parser.add_argument('--dim_feedforward', type=int, default=3072)
     parser.add_argument('--dropout', type=float, default=0.1)
     
     # MTP args
     parser.add_argument('--mtp_heads', type=int, default=0, help='Number of Multi-Token Prediction heads')
 
     # MoE args
-    parser.add_argument('--num_experts', type=int, default=0, help='Number of experts for MoE')
-    parser.add_argument('--num_experts_per_tok', type=int, default=0, help='Number of experts selected per token')
+    parser.add_argument('--num_experts', type=int, default=1, help='Number of experts for MoE')
+    parser.add_argument('--num_experts_per_tok', type=int, default=1, help='Number of experts selected per token')
     parser.add_argument('--aux_loss_coef', type=float, default=0, help='Coefficient for auxiliary load balancing loss')
     parser.add_argument('--warmup_steps', type=int, default=200, help='Number of warmup steps')
+    parser.add_argument('--capacity_factor', type=float, default=1.25, help='Capacity factor for MoE routing')
 
     args = parser.parse_args(argv)
 
@@ -119,7 +120,8 @@ def main(*argv):
         dropout=args.dropout,
         mtp_heads=args.mtp_heads,
         num_experts=args.num_experts,
-        num_experts_per_tok=args.num_experts_per_tok
+        num_experts_per_tok=args.num_experts_per_tok,
+        capacity_factor=args.capacity_factor
     )
     model.to(device)
 
@@ -272,9 +274,9 @@ def main(*argv):
         with torch.no_grad():
             for x1, x2, t1, t2, value in tqdm(test_dataloader, desc='Testing', leave=False):
                 if args.mtp_heads > 0:
-                    y1, y2, _, _, _ = model(x1, x2) # Ignore MTP outputs and aux_loss for test
+                    y1, y2, _, _ = model(x1, x2) # Ignore MTP outputs for test
                 else:
-                    y1, y2, _ = model(x1, x2)
+                    y1, y2 = model(x1, x2)
 
                 steps += 1
                 loss1 = cross_entropy_loss(y1, t1).mean()
@@ -387,7 +389,7 @@ def main(*argv):
                     x1, x2, t1, t2, value = train_dataloader.mini_batch(train_data[batch_indices])
                     
                     # Forward
-                    y1, y2, mtp_policy_logits, mtp_value_logits, aux_loss = model(x1, x2)
+                    y1, y2, mtp_policy_logits, mtp_value_logits = model(x1, x2)
                     
                     model.zero_grad(set_to_none=True)
                     loss1 = cross_entropy_loss_with_soft_target(y1, t1)
@@ -425,7 +427,7 @@ def main(*argv):
                     loss3 = bce_with_logits_loss(y2, value)
                     
                     # Combine losses (MTP loss is added to main loss)
-                    loss = loss1 + (1 - val_lambda) * loss2 + val_lambda * loss3 + mtp_loss + args.aux_loss_coef * aux_loss
+                    loss = loss1 + (1 - val_lambda) * loss2 + val_lambda * loss3 + mtp_loss
                     
                 else:
                     # Standard training
@@ -434,7 +436,7 @@ def main(*argv):
                     except StopIteration:
                         break
                         
-                    y1, y2, aux_loss = model(x1, x2)
+                    y1, y2 = model(x1, x2)
 
                     model.zero_grad(set_to_none=True)
                     loss1 = cross_entropy_loss_with_soft_target(y1, t1)
@@ -447,7 +449,7 @@ def main(*argv):
                         loss1 += args.beta * (F.softmax(y1, dim=1) * F.log_softmax(y1, dim=1)).sum(dim=1).mean()
                     loss2 = bce_with_logits_loss(y2, t2)
                     loss3 = bce_with_logits_loss(y2, value)
-                    loss = loss1 + (1 - val_lambda) * loss2 + val_lambda * loss3 + args.aux_loss_coef * aux_loss
+                    loss = loss1 + (1 - val_lambda) * loss2 + val_lambda * loss3
 
             scaler.scale(loss).backward()
             if args.clip_grad_max_norm:
@@ -474,8 +476,6 @@ def main(*argv):
                 }
                 if args.mtp_heads > 0:
                     postfix['mtp_loss'] = f'{mtp_loss.item():.4f}'
-                if args.num_experts > 1:
-                    postfix['aux_loss'] = f'{aux_loss.item():.4f}'
                     
                 pbar.set_postfix(postfix)
 
@@ -486,9 +486,9 @@ def main(*argv):
                 x1, x2, t1, t2, value = test_dataloader.sample()
                 with torch.no_grad():
                     if args.mtp_heads > 0:
-                        y1, y2, _, _, _ = model(x1, x2)
+                        y1, y2, _, _ = model(x1, x2)
                     else:
-                        y1, y2, _ = model(x1, x2)
+                        y1, y2 = model(x1, x2)
 
                     loss1 = cross_entropy_loss(y1, t1).mean()
                     loss2 = bce_with_logits_loss(y2, t2)
@@ -566,5 +566,3 @@ def main(*argv):
 
 if __name__ == '__main__':
     main(*sys.argv[1:])
-
-
