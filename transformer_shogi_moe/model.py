@@ -118,12 +118,13 @@ class RMSNorm(nn.Module):
         return self.weight * x_normed
 
 class MoELayer(nn.Module):
-    def __init__(self, d_model, dim_feedforward, num_experts, num_experts_per_tok, dropout=0.1):
+    def __init__(self, d_model, dim_feedforward, num_experts, num_experts_per_tok, dropout=0.1, capacity_factor=1.25):
         super().__init__()
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.d_model = d_model
         self.dim_feedforward = dim_feedforward
+        self.capacity_factor = capacity_factor
         
         # Experts weights: (num_experts, in_features, out_features)
         # w1: d_model -> dim_feedforward
@@ -147,6 +148,7 @@ class MoELayer(nn.Module):
 
     def forward(self, x):
         batch_size, seq_len, d_model = x.shape
+        num_tokens = batch_size * seq_len
         x_flat = x.reshape(-1, d_model)
         
         # Router logits: (batch * seq_len, num_experts)
@@ -169,9 +171,8 @@ class MoELayer(nn.Module):
         # Normalize weights
         routing_weights_topk = routing_weights_topk / (routing_weights_topk.sum(dim=-1, keepdim=True) + 1e-6)
         
-        # Calculate auxiliary loss (load balancing)
         if self.training:
-            # Update bias based on usage
+            # Update bias based on usage (DeepSeek style balancing)
             with torch.no_grad():
                 mask = F.one_hot(selected_experts, num_classes=self.num_experts).sum(dim=1) # (T, num_experts)
                 usage = mask.float().mean(dim=0) # (num_experts,)
@@ -181,60 +182,66 @@ class MoELayer(nn.Module):
                 error = target_usage - usage
                 self.e_score_correction_bias += self.bias_update_rate * error
 
-            # Aux loss (standard)
-            density_1_proxy = routing_probs.mean(dim=0)
-            density_1 = mask.float().mean(dim=0)
-            aux_loss = (density_1_proxy * density_1).sum() * self.num_experts
-        else:
-            aux_loss = 0.0
-
-        # Parallel Expert Computation using BMM
+        # --- Capacity limited routing (Fixed Capacity) ---
+        # Solving the torch.compile error by making tensor shapes data-independent
         
-        # Flatten selected experts to (B*T*k)
-        expert_indices = selected_experts.flatten()
+        # Calculate capacity per expert
+        # capacity = ceil(num_tokens * k * factor / E)
+        capacity = int(self.capacity_factor * num_tokens * self.num_experts_per_tok / self.num_experts)
         
-        # Repeat x for each selected expert: (B*T, k, D) -> (B*T*k, D)
+        # Flatten selected experts: (B*T, k) -> (B*T*k)
+        flat_selected_experts = selected_experts.view(-1)
+        
+        # Calculate rank of each token within its expert
+        expert_mask = F.one_hot(flat_selected_experts, num_classes=self.num_experts) # (Total, E)
+        
+        # Cumsum to get rank.
+        # (Total, E)
+        token_priority = torch.cumsum(expert_mask, dim=0) 
+        
+        # Get the rank for the assigned expert
+        # token_priority is (Total, E), we pick the one matching flat_selected_experts
+        ranks = token_priority.gather(1, flat_selected_experts.unsqueeze(1)).squeeze(1) - 1
+        
+        # Filter tokens exceeding capacity
+        valid_mask = ranks < capacity
+        valid_indices = torch.nonzero(valid_mask, as_tuple=True)[0]
+        
+        # Calculate scatter destination indices: expert_id * capacity + rank
+        valid_experts = flat_selected_experts[valid_indices]
+        valid_ranks = ranks[valid_indices]
+        scatter_indices = valid_experts * capacity + valid_ranks
+        
+        # Repeat x for each k: (B*T, D) -> (B*T, k, D) -> (B*T*k, D)
         x_repeated = x_flat.unsqueeze(1).expand(-1, self.num_experts_per_tok, -1).reshape(-1, d_model)
         
-        # Sort tokens by expert index to group them
-        sorted_indices = torch.argsort(expert_indices)
-        sorted_expert_indices = expert_indices[sorted_indices]
-        sorted_x = x_repeated[sorted_indices]
+        # Create padded buffer: (E * C, D) using FIXED capacity
+        # This shape depends only on batch size (num_tokens), not data content
+        padded_x = torch.zeros(self.num_experts * capacity, d_model, device=x.device, dtype=x.dtype)
         
-        # Count tokens per expert
-        counts = torch.bincount(sorted_expert_indices, minlength=self.num_experts)
-        max_count = counts.max().item()
+        # Scatter inputs
+        padded_x.index_copy_(0, scatter_indices, x_repeated[valid_indices])
         
-        # Pad inputs to (num_experts, max_count, d_model)
-        padded_x = torch.zeros(self.num_experts, max_count, d_model, device=x.device, dtype=x.dtype)
+        # Reshape for computation: (E, C, D)
+        padded_x = padded_x.view(self.num_experts, capacity, d_model)
         
-        start = 0
-        for i in range(self.num_experts):
-            c = counts[i].item()
-            if c > 0:
-                padded_x[i, :c] = sorted_x[start:start+c]
-                start += c
-        
-        # BMM 1: (E, M, D) @ (E, D, H) -> (E, M, H)
+        # BMM 1: (E, C, D) @ (E, D, H) -> (E, C, H)
         h = torch.bmm(padded_x, self.w1)
         h = F.gelu(h)
         h = self.dropout(h)
         
-        # BMM 2: (E, M, H) @ (E, H, D) -> (E, M, D)
+        # BMM 2: (E, C, H) @ (E, H, D) -> (E, C, D)
         out_padded = torch.bmm(h, self.w2)
         
-        # Unpad and reconstruct sorted output
-        sorted_out = torch.zeros_like(sorted_x)
-        start = 0
-        for i in range(self.num_experts):
-            c = counts[i].item()
-            if c > 0:
-                sorted_out[start:start+c] = out_padded[i, :c]
-                start += c
+        # Gather outputs back
+        # Reshape back to (E*C, D)
+        out_padded_flat = out_padded.view(-1, d_model)
         
-        # Unsort to get back to original order (B*T*k)
-        out_repeated = torch.empty_like(x_repeated)
-        out_repeated[sorted_indices] = sorted_out
+        # Output container (same shape as x_repeated)
+        out_repeated = torch.zeros_like(x_repeated)
+        
+        # Gather: we pull from padded buffer back to valid positions
+        out_repeated.index_copy_(0, valid_indices, out_padded_flat[scatter_indices])
         
         # Weight outputs and sum over k
         # routing_weights_topk: (B*T, k) -> flatten -> (B*T*k)
@@ -245,16 +252,16 @@ class MoELayer(nn.Module):
         out_weighted = out_weighted.view(-1, self.num_experts_per_tok, d_model)
         final_output = out_weighted.sum(dim=1)
             
-        return final_output.view(batch_size, seq_len, d_model), aux_loss
+        return final_output.view(batch_size, seq_len, d_model)
 
 class TransformerEncoderLayerGQA(nn.Module):
-    def __init__(self, d_model, n_attention_head, n_kv_head, dim_feedforward, dropout=0.1, num_experts=1, num_experts_per_tok=1):
+    def __init__(self, d_model, n_attention_head, n_kv_head, dim_feedforward, dropout=0.1, num_experts=1, num_experts_per_tok=1, capacity_factor=1.25):
         super().__init__()
         self.self_attn = GroupedQueryAttention(d_model, n_attention_head, n_kv_head, dropout)
         
         self.num_experts = num_experts
         if num_experts > 1:
-            self.moe = MoELayer(d_model, dim_feedforward, num_experts, num_experts_per_tok, dropout)
+            self.moe = MoELayer(d_model, dim_feedforward, num_experts, num_experts_per_tok, dropout, capacity_factor)
         else:
             self.linear1 = nn.Linear(d_model, dim_feedforward)
             self.dropout = nn.Dropout(dropout)
@@ -271,21 +278,20 @@ class TransformerEncoderLayerGQA(nn.Module):
         src = src + self.dropout1(src2)
         src = self.norm1(src)
         
-        aux_loss = 0.0
         if self.num_experts > 1:
-            src2, aux_loss = self.moe(src)
+            src2 = self.moe(src)
         else:
             src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
         
         src = src + self.dropout2(src2)
         src = self.norm2(src)
-        return src, aux_loss
+        return src
 
 
 
 
 class TransformerPolicyValueNetwork(nn.Module):
-    def __init__(self, d_model=256, n_attention_head=8, n_kv_head=2, num_layers=4, dim_feedforward=512, dropout=0.1, mtp_heads=0, num_experts=1, num_experts_per_tok=1):
+    def __init__(self, d_model=256, n_attention_head=8, n_kv_head=2, num_layers=4, dim_feedforward=512, dropout=0.1, mtp_heads=0, num_experts=1, num_experts_per_tok=1, capacity_factor=1.25):
         super(TransformerPolicyValueNetwork, self).__init__()
         
         self.d_model = d_model
@@ -293,7 +299,8 @@ class TransformerPolicyValueNetwork(nn.Module):
         self.num_experts = num_experts
 
         # Embedding for board features (x1)
-        self.embedding1 = BoardEmbedding(FEATURES1_NUM, d_model)
+        #self.embedding1 = BoardEmbedding(FEATURES1_NUM, d_model)
+        self.embedding1 = nn.Linear(FEATURES1_NUM, d_model) 
         
         # Embedding for global/hand features (x2)
         self.embedding2 = nn.Linear(FEATURES2_NUM, d_model)
@@ -302,7 +309,7 @@ class TransformerPolicyValueNetwork(nn.Module):
         self.pos_encoder = nn.Parameter(torch.zeros(1, 81, d_model))
         
         self.layers = nn.ModuleList([
-            TransformerEncoderLayerGQA(d_model, n_attention_head, n_kv_head, dim_feedforward, dropout, num_experts, num_experts_per_tok)
+            TransformerEncoderLayerGQA(d_model, n_attention_head, n_kv_head, dim_feedforward, dropout, num_experts, num_experts_per_tok, capacity_factor)
             for _ in range(num_layers)
         ])
         
@@ -343,10 +350,8 @@ class TransformerPolicyValueNetwork(nn.Module):
         x = x + self.embedding2(x2_flat)
         x = x + self.pos_encoder
         
-        total_aux_loss = 0.0
         for layer in self.layers:
-            x, aux_loss = layer(x)
-            total_aux_loss += aux_loss
+            x = layer(x)
         
         y1 = self.policy_head(x)
         
@@ -357,6 +362,6 @@ class TransformerPolicyValueNetwork(nn.Module):
         if self.mtp_heads > 0:
             mtp_policy_logits = [head(x) for head in self.mtp_policy_heads]
             mtp_value_logits = [head(x.view(b, -1)) for head in self.mtp_value_heads]
-            return y1, y2, mtp_policy_logits, mtp_value_logits, total_aux_loss
+            return y1, y2, mtp_policy_logits, mtp_value_logits
         
-        return y1, y2, total_aux_loss
+        return y1, y2
